@@ -1,150 +1,151 @@
 import requests
 import csv
 import os
-import time
+import base64
+import zipfile
+import io
+import json
 
 # --- CONFIGURATION ---
 API_KEY = os.environ.get('LEGISCAN_API_KEY')  
 STATE = 'MI'                   
 BASE_URL = 'https://api.legiscan.com/'
 
-def get_current_session_id():
-    print("Finding current Michigan legislative session ID...")
+def get_current_session():
+    print("Finding current Michigan legislative session...")
     params = {'key': API_KEY, 'op': 'getSessionList', 'state': STATE}
-    response = requests.get(BASE_URL, params=params)
-    if response.status_code == 200 and response.json().get('status') == 'OK':
-        latest_session = max(response.json()['sessions'], key=lambda x: x['session_id'])
-        return latest_session['session_id']
+    r = requests.get(BASE_URL, params=params).json()
+    if r.get('status') == 'OK':
+        latest = max(r['sessions'], key=lambda x: x['session_id'])
+        return latest['session_id']
+    return None
+
+def get_dataset_access_key(session_id):
+    print("Locating free Bulk Dataset access key...")
+    params = {'key': API_KEY, 'op': 'getDatasetList', 'state': STATE}
+    r = requests.get(BASE_URL, params=params).json()
+    if r.get('status') == 'OK':
+        for ds in r.get('datasetlist', []):
+            if ds['session_id'] == session_id:
+                return ds['access_key']
     return None
 
 def get_representatives(session_id):
-    print("Fetching House roster and party affiliations...")
+    print("Fetching official House roster...")
     params = {'key': API_KEY, 'op': 'getSessionPeople', 'id': session_id}
-    response = requests.get(BASE_URL, params=params)
+    r = requests.get(BASE_URL, params=params).json()
     
     reps = {}
-    if response.status_code == 200 and response.json().get('status') == 'OK':
-        for person in response.json()['sessionpeople']['people']:
+    if r.get('status') == 'OK':
+        for person in r['sessionpeople']['people']:
             if person.get('role') == 'Rep':
                 reps[person['people_id']] = {
                     'Name': person['name'],
                     'Party': person.get('party', 'Unknown'),
-                    'Total Votes': 0,
+                    'Contested Votes Cast': 0,
                     'Votes Against Party': 0
                 }
     return reps
 
-def analyze_party_rebels(reps, session_id):
-    print("Pulling the 20 most recently active bills to analyze voting records...")
+def process_bulk_dataset(session_id, access_key, reps):
+    print("Downloading Bulk Dataset archive (this may take 10-20 seconds)...")
+    params = {'key': API_KEY, 'op': 'getDataset', 'id': session_id, 'access_key': access_key}
+    r = requests.get(BASE_URL, params=params).json()
     
-    # 1. Get the Master List of bills
-    params = {'key': API_KEY, 'op': 'getMasterList', 'id': session_id}
-    response = requests.get(BASE_URL, params=params)
-    if response.status_code != 200 or response.json().get('status') != 'OK':
-        print("Failed to get Master List.")
-        return reps
-
-    masterlist = response.json()['masterlist']
-    
-    # Convert the dictionary to a list so we can sort it
-    bills_list = [bill for key, bill in masterlist.items() if key != 'session']
-    
-    # Sort the list by the 'last_action_date' from newest to oldest
-    bills_list.sort(key=lambda x: x.get('last_action_date', ''), reverse=True)
-
-    # Grab the IDs of the top 20 most recent bills 
-    bill_ids_to_check = [bill['bill_id'] for bill in bills_list[:20]]
-
-    # 2. Extract Roll Call IDs from those 20 bills
-    roll_call_ids = []
-    for bill_id in bill_ids_to_check:
-        params = {'key': API_KEY, 'op': 'getBill', 'id': bill_id}
-        resp = requests.get(BASE_URL, params=params)
-        time.sleep(0.5) # Speed limit pause
-        if resp.status_code == 200 and resp.json().get('status') == 'OK':
-            # Check if this bill has any votes recorded
-            for rc in resp.json()['bill'].get('votes', []):
-                roll_call_ids.append(rc['roll_call_id'])
-
-    print(f"Found {len(roll_call_ids)} recent roll call votes to analyze...")
-
-    # 3. Analyze who voted against their party
-    for rc_id in roll_call_ids:
-        params = {'key': API_KEY, 'op': 'getRollCall', 'id': rc_id}
-        resp = requests.get(BASE_URL, params=params)
-        time.sleep(0.5) # Speed limit pause
+    if r.get('status') != 'OK':
+        print("Failed to download dataset.")
+        return list(reps.values())
         
-        if resp.status_code == 200 and resp.json().get('status') == 'OK':
-            votes = resp.json()['roll_call']['votes']
-            
-            # Tally what the majority of each party voted (1 = Yea, 2 = Nay)
-            party_tallies = {'D': {1: 0, 2: 0}, 'R': {1: 0, 2: 0}}
-            
-            for vote in votes:
-                pid = vote['people_id']
-                v_id = vote['vote_id']
-                if pid in reps and v_id in [1, 2]: # Only count Yeas (1) and Nays (2)
-                    party = reps[pid]['Party']
-                    if party in party_tallies:
-                        party_tallies[party][v_id] += 1
-            
-            # Determine the "Party Line" (which way did the majority of the party vote?)
-            dem_line = 1 if party_tallies['D'][1] > party_tallies['D'][2] else 2
-            gop_line = 1 if party_tallies['R'][1] > party_tallies['R'][2] else 2
-            
-            # Check each rep's vote against their party's line
-            for vote in votes:
-                pid = vote['people_id']
-                v_id = vote['vote_id']
-                
-                if pid in reps and v_id in [1, 2]:
-                    reps[pid]['Total Votes'] += 1
-                    party = reps[pid]['Party']
-                    
-                    if party == 'D' and v_id != dem_line:
-                        reps[pid]['Votes Against Party'] += 1
-                    elif party == 'R' and v_id != gop_line:
-                        reps[pid]['Votes Against Party'] += 1
-
+    print("Unzipping archive and analyzing thousands of votes...")
+    zip_bytes = base64.b64decode(r['dataset']['zip'])
+    
+    analyzed_roll_calls = 0
+    
+    # Unzip the file directly in the cloud's memory
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        for filename in z.namelist():
+            # Find the roll call files hidden inside the ZIP folders
+            if 'roll_call' in filename.lower() and filename.endswith('.json'):
+                with z.open(filename) as f:
+                    try:
+                        data = json.load(f)
+                        rc = data.get('roll_call', {})
+                        votes = rc.get('votes', [])
+                        
+                        # 1. Check if the vote is contested (At least 10% opposition)
+                        yeas = rc.get('yea', 0)
+                        nays = rc.get('nay', 0)
+                        total = yeas + nays
+                        
+                        if total == 0:
+                            continue
+                            
+                        opposition_rate = min(yeas, nays) / total
+                        if opposition_rate < 0.10: # Skip uncontroversial votes
+                            continue
+                            
+                        analyzed_roll_calls += 1
+                        
+                        # 2. Determine Party Lines
+                        party_tallies = {'D': {1: 0, 2: 0}, 'R': {1: 0, 2: 0}}
+                        for vote in votes:
+                            pid = vote['people_id']
+                            v_id = vote['vote_id']
+                            if pid in reps and v_id in [1, 2]: # 1 = Yea, 2 = Nay
+                                party = reps[pid]['Party']
+                                if party in party_tallies:
+                                    party_tallies[party][v_id] += 1
+                                    
+                        dem_line = 1 if party_tallies['D'][1] > party_tallies['D'][2] else 2
+                        gop_line = 1 if party_tallies['R'][1] > party_tallies['R'][2] else 2
+                        
+                        # 3. Grade the Representatives based on the true party line
+                        for vote in votes:
+                            pid = vote['people_id']
+                            v_id = vote['vote_id']
+                            
+                            if pid in reps and v_id in [1, 2]:
+                                reps[pid]['Contested Votes Cast'] += 1
+                                party = reps[pid]['Party']
+                                
+                                if party == 'D' and v_id != dem_line:
+                                    reps[pid]['Votes Against Party'] += 1
+                                elif party == 'R' and v_id != gop_line:
+                                    reps[pid]['Votes Against Party'] += 1
+                                    
+                    except Exception:
+                        continue # If a file is corrupted, just skip it and move on
+                        
+    print(f"Analysis complete. Evaluated {analyzed_roll_calls} highly contested roll calls across the entire session.")
     return list(reps.values())
 
 def save_to_csv(data, filename='mi_reps_data.csv'):
-    print(f"Saving Rebel Data to {filename}...")
+    print(f"Saving Final Rebel Data to {filename}...")
     
-    # Calculate the exact rebellion percentage before saving
+    # Calculate the exact rebellion percentage
     for row in data:
-        if row['Total Votes'] > 0:
-            row['Rebellion Rate (%)'] = round((row['Votes Against Party'] / row['Total Votes']) * 100, 1)
+        if row['Contested Votes Cast'] > 0:
+            row['True Rebellion Rate (%)'] = round((row['Votes Against Party'] / row['Contested Votes Cast']) * 100, 1)
         else:
-            row['Rebellion Rate (%)'] = 0.0
+            row['True Rebellion Rate (%)'] = 0.0
 
-    # Sort the highest rebels to the top of the spreadsheet
-    data = sorted(data, key=lambda x: x['Rebellion Rate (%)'], reverse=True) 
-    
-    headers = ['Name', 'Party', 'Total Votes', 'Votes Against Party', 'Rebellion Rate (%)']
+    # Sort the most independent legislators to the very top
+    data = sorted(data, key=lambda x: x['True Rebellion Rate (%)'], reverse=True) 
+    headers = ['Name', 'Party', 'Contested Votes Cast', 'Votes Against Party', 'True Rebellion Rate (%)']
     
     with open(filename, mode='w', newline='', encoding='utf-8') as file:
         writer = csv.DictWriter(file, fieldnames=headers)
         writer.writeheader()
-        for row in data:
-            writer.writerow({
-                'Name': row['Name'],
-                'Party': row['Party'],
-                'Total Votes': row['Total Votes'],
-                'Votes Against Party': row['Votes Against Party'],
-                'Rebellion Rate (%)': row['Rebellion Rate (%)']
-            })
+        writer.writerows(data)
             
-    print("Success! Rebel CSV generated.")
+    print("Success! Professional-grade CSV generated.")
 
 if __name__ == "__main__":
-    session_id = get_current_session_id()
-    if session_id:
-        reps_data = get_representatives(session_id)
-        if reps_data:
-            final_data = analyze_party_rebels(reps_data, session_id)
+    sid = get_current_session()
+    if sid:
+        akey = get_dataset_access_key(sid)
+        if akey:
+            reps = get_representatives(sid)
+            final_data = process_bulk_dataset(sid, akey, reps)
             save_to_csv(final_data)
         else:
-            print("Failed to pull representatives.")
-    else:
-        print("Failed to find session ID.")
