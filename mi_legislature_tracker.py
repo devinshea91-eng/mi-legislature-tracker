@@ -8,100 +8,133 @@ API_KEY = os.environ.get('LEGISCAN_API_KEY')
 STATE = 'MI'                   
 BASE_URL = 'https://api.legiscan.com/'
 
-def get_recent_sessions():
-    print("Finding the current and previous Michigan sessions...")
+def get_current_session_id():
+    print("Finding current Michigan legislative session ID...")
     params = {'key': API_KEY, 'op': 'getSessionList', 'state': STATE}
     response = requests.get(BASE_URL, params=params)
-    
-    session_ids = []
-    if response.status_code == 200:
-        data = response.json()
-        if data.get('status') == 'OK':
-            # Sort all sessions from newest to oldest
-            sessions = data.get('sessions', [])
-            sessions.sort(key=lambda x: x.get('session_id', 0), reverse=True)
-            
-            # Grab the 2 most recent session IDs (Current and Previous)
-            session_ids = [s['session_id'] for s in sessions[:2]]
-            print(f"Found Session IDs: {session_ids}")
-        else:
-            print("API Error: Could not load sessions.")
-    return session_ids
+    if response.status_code == 200 and response.json().get('status') == 'OK':
+        latest_session = max(response.json()['sessions'], key=lambda x: x['session_id'])
+        return latest_session['session_id']
+    return None
 
-def get_representatives(session_ids):
+def get_representatives(session_id):
+    print("Fetching House roster and party affiliations...")
+    params = {'key': API_KEY, 'op': 'getSessionPeople', 'id': session_id}
+    response = requests.get(BASE_URL, params=params)
+    
     reps = {}
-    for sid in session_ids:
-        print(f"Fetching official House roster for session {sid}...")
-        params = {'key': API_KEY, 'op': 'getSessionPeople', 'id': sid}
-        response = requests.get(BASE_URL, params=params)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('status') == 'OK':
-                for person in data['sessionpeople']['people']:
-                    # Only grab House Representatives
-                    if person.get('role') == 'Rep':
-                        pid = person['people_id']
-                        if pid not in reps:
-                            reps[pid] = {
-                                'Name': person['name'],
-                                'Party': person.get('party', 'Unknown'),
-                                'Bills Introduced': 0,
-                                'Bills Passed': 0
-                            }
-        time.sleep(0.5) # Pause to respect API rate limits
+    if response.status_code == 200 and response.json().get('status') == 'OK':
+        for person in response.json()['sessionpeople']['people']:
+            if person.get('role') == 'Rep':
+                reps[person['people_id']] = {
+                    'Name': person['name'],
+                    'Party': person.get('party', 'Unknown'),
+                    'Total Votes': 0,
+                    'Votes Against Party': 0
+                }
     return reps
 
-def process_sponsored_bills(reps, session_ids):
-    print(f"Counting bills for {len(reps)} representatives... (This will take about 1-2 minutes)")
+def analyze_party_rebels(reps, session_id):
+    print("Pulling a sample of recent bills to analyze voting records...")
     
-    for pid, rep_data in reps.items():
-        params = {'key': API_KEY, 'op': 'getSponsoredList', 'id': pid}
-        response = requests.get(BASE_URL, params=params)
+    # 1. Get the Master List of bills
+    params = {'key': API_KEY, 'op': 'getMasterList', 'id': session_id}
+    response = requests.get(BASE_URL, params=params)
+    if response.status_code != 200 or response.json().get('status') != 'OK':
+        return reps
+
+    masterlist = response.json()['masterlist']
+    bill_ids_to_check = []
+    
+    # Grab a small sample of 5 recent bills to prevent server timeouts
+    for key, bill in masterlist.items():
+        if key != 'session' and len(bill_ids_to_check) < 5:
+            bill_ids_to_check.append(bill['bill_id'])
+
+    # 2. Extract Roll Call IDs from those bills
+    roll_call_ids = []
+    for bill_id in bill_ids_to_check:
+        params = {'key': API_KEY, 'op': 'getBill', 'id': bill_id}
+        resp = requests.get(BASE_URL, params=params)
+        time.sleep(0.5) # Speed limit pause
+        if resp.status_code == 200 and resp.json().get('status') == 'OK':
+            for rc in resp.json()['bill'].get('votes', []):
+                roll_call_ids.append(rc['roll_call_id'])
+
+    print(f"Analyzing {len(roll_call_ids)} recent roll call votes...")
+
+    # 3. Analyze who voted against their party
+    for rc_id in roll_call_ids:
+        params = {'key': API_KEY, 'op': 'getRollCall', 'id': rc_id}
+        resp = requests.get(BASE_URL, params=params)
+        time.sleep(0.5) # Speed limit pause
         
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('status') == 'OK':
-                # LegiScan usually stores this under 'sponsoredbills' or 'bills'
-                bills = data.get('sponsoredbills') or data.get('bills') or []
-                
-                for bill in bills:
-                    # Only count bills if they belong to the 2 sessions we selected
-                    if bill.get('session_id') in session_ids:
-                        rep_data['Bills Introduced'] += 1
-                        
-                        # Status 4 = Passed/Enacted
-                        if bill.get('status') == 4:
-                            rep_data['Bills Passed'] += 1
-                            
-        time.sleep(0.5) # Pause so LegiScan doesn't block us
+        if resp.status_code == 200 and resp.json().get('status') == 'OK':
+            votes = resp.json()['roll_call']['votes']
             
+            # Tally what the majority of each party voted (1 = Yea, 2 = Nay)
+            party_tallies = {'D': {1: 0, 2: 0}, 'R': {1: 0, 2: 0}}
+            
+            for vote in votes:
+                pid = vote['people_id']
+                v_id = vote['vote_id']
+                if pid in reps and v_id in [1, 2]: # Only count Yeas and Nays
+                    party = reps[pid]['Party']
+                    if party in party_tallies:
+                        party_tallies[party][v_id] += 1
+            
+            # Determine the "Party Line" (which way did the majority vote?)
+            dem_line = 1 if party_tallies['D'][1] > party_tallies['D'][2] else 2
+            gop_line = 1 if party_tallies['R'][1] > party_tallies['R'][2] else 2
+            
+            # Check each rep against their party line
+            for vote in votes:
+                pid = vote['people_id']
+                v_id = vote['vote_id']
+                
+                if pid in reps and v_id in [1, 2]:
+                    reps[pid]['Total Votes'] += 1
+                    party = reps[pid]['Party']
+                    
+                    if party == 'D' and v_id != dem_line:
+                        reps[pid]['Votes Against Party'] += 1
+                    elif party == 'R' and v_id != gop_line:
+                        reps[pid]['Votes Against Party'] += 1
+
     return list(reps.values())
 
 def save_to_csv(data, filename='mi_reps_data.csv'):
-    print(f"Saving finalized data to {filename}...")
-    headers = ['Name', 'Party', 'Bills Introduced', 'Bills Passed']
+    print(f"Saving Rebel Data to {filename}...")
     
-    # Sort alphabetically by name
-    data = sorted(data, key=lambda x: x['Name'])
+    # Calculate the exact rebellion percentage before saving
+    for row in data:
+        if row['Total Votes'] > 0:
+            row['Rebellion Rate (%)'] = round((row['Votes Against Party'] / row['Total Votes']) * 100, 1)
+        else:
+            row['Rebellion Rate (%)'] = 0.0
+
+    headers = ['Name', 'Party', 'Total Votes', 'Votes Against Party', 'Rebellion Rate (%)']
+    data = sorted(data, key=lambda x: x['Rebellion Rate (%)'], reverse=True) # Sort highest rebels to the top
     
     with open(filename, mode='w', newline='', encoding='utf-8') as file:
         writer = csv.DictWriter(file, fieldnames=headers)
         writer.writeheader()
         for row in data:
-            writer.writerow(row)
+            # We don't need these columns in the final CSV if we are just looking at the rate, but keeping them helps verify the math
+            writer.writerow({
+                'Name': row['Name'],
+                'Party': row['Party'],
+                'Total Votes': row['Total Votes'],
+                'Votes Against Party': row['Votes Against Party'],
+                'Rebellion Rate (%)': row['Rebellion Rate (%)']
+            })
             
-    print("Success! Your comprehensive spreadsheet is ready.")
+    print("Success! Rebel CSV generated.")
 
 if __name__ == "__main__":
-    if not API_KEY:
-        print("Error: API Key not found in GitHub Secrets!")
-    else:
-        sessions = get_recent_sessions()
-        if sessions:
-            reps_data = get_representatives(sessions)
-            if reps_data:
-                final_data = process_sponsored_bills(reps_data, sessions)
-                save_to_csv(final_data)
-            else:
-                print("Failed to pull representatives.")
+    session_id = get_current_session_id()
+    if session_id:
+        reps_data = get_representatives(session_id)
+        if reps_data:
+            final_data = analyze_party_rebels(reps_data, session_id)
+            save_to_csv(final_data)
