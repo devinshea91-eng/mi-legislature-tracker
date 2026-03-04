@@ -26,10 +26,10 @@ jobs:
         LEGISCAN_API_KEY: ${{ secrets.LEGISCAN_API_KEY }}
       run: python mi_legislature_tracker.py
 
-    - name: Commit and push the new CSV
+  - name: Commit and push the new CSV
       run: |
         git config --global user.name "github-actions[bot]"
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
-        git add mi_reps_data.csv
+        git add *.csv
         git diff --quiet && git diff --staged --quiet || git commit -m "Automated daily data update"
         git push
