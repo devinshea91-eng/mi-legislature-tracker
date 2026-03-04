@@ -11,16 +11,23 @@ API_KEY = os.environ.get('LEGISCAN_API_KEY')
 STATE = 'MI'                   
 BASE_URL = 'https://api.legiscan.com/'
 
-def get_current_session():
-    print("Finding current Michigan legislative session...")
+def get_previous_session():
+    print("Finding the 2023-2024 Michigan legislative session...")
     params = {'key': API_KEY, 'op': 'getSessionList', 'state': STATE}
     r = requests.get(BASE_URL, params=params).json()
     if r.get('status') == 'OK':
         # Filter out empty Special Sessions, only grab Regular Sessions
         regular_sessions = [s for s in r['sessions'] if s.get('special') == 0]
-        latest = max(regular_sessions, key=lambda x: x['session_id'])
-        print(f"Targeting: {latest.get('session_title')} (ID: {latest['session_id']})")
-        return latest['session_id']
+        
+        # Sort them from newest to oldest
+        regular_sessions.sort(key=lambda x: x['session_id'], reverse=True)
+        
+        # Index 0 is the current session (2025-2026)
+        # Index 1 is the previous session (2023-2024)
+        if len(regular_sessions) > 1:
+            target_session = regular_sessions[1]
+            print(f"Targeting: {target_session.get('session_title')} (ID: {target_session['session_id']})")
+            return target_session['session_id']
     return None
 
 def get_dataset_access_key(session_id):
@@ -34,7 +41,7 @@ def get_dataset_access_key(session_id):
     return None
 
 def get_representatives(session_id):
-    print("Fetching official House roster...")
+    print("Fetching official House roster for the selected session...")
     params = {'key': API_KEY, 'op': 'getSessionPeople', 'id': session_id}
     r = requests.get(BASE_URL, params=params).json()
     
@@ -68,13 +75,11 @@ def process_bulk_dataset(session_id, access_key, reps):
     
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
         for filename in z.namelist():
-            # FIX: LegiScan puts these in a folder named 'vote', not 'roll_call'!
             if '/vote/' in filename.lower() and filename.endswith('.json'):
                 total_roll_calls_found += 1
                 with z.open(filename) as f:
                     try:
                         data = json.load(f)
-                        # Ensure we grab the data regardless of what LegiScan names the JSON key
                         rc = data.get('roll_call') or data.get('vote') or {}
                         votes = rc.get('votes', [])
                         
@@ -123,7 +128,7 @@ def process_bulk_dataset(session_id, access_key, reps):
     print(f"Total votes successfully evaluated: {analyzed_roll_calls}")
     return list(reps.values())
 
-def save_to_csv(data, filename='mi_reps_data.csv'):
+def save_to_csv(data, filename='mi_reps_data_2023_2024.csv'):
     print(f"Saving Final Rebel Data to {filename}...")
     
     for row in data:
@@ -143,7 +148,7 @@ def save_to_csv(data, filename='mi_reps_data.csv'):
     print("Success! Professional-grade CSV generated.")
 
 if __name__ == "__main__":
-    sid = get_current_session()
+    sid = get_previous_session()
     if sid:
         akey = get_dataset_access_key(sid)
         if akey:
