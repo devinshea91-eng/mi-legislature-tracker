@@ -45,7 +45,7 @@ def get_representatives(session_id):
                 reps[person['people_id']] = {
                     'Name': person['name'],
                     'Party': person.get('party', 'Unknown'),
-                    'Contested Votes Cast': 0,
+                    'Total Votes Cast': 0,
                     'Votes Against Party': 0
                 }
     return reps
@@ -59,7 +59,7 @@ def process_bulk_dataset(session_id, access_key, reps):
         print("Failed to download dataset.")
         return list(reps.values())
         
-    print("Unzipping archive and analyzing votes...")
+    print("Unzipping archive and analyzing ALL votes...")
     zip_bytes = base64.b64decode(r['dataset']['zip'])
     
     total_roll_calls_found = 0
@@ -76,22 +76,19 @@ def process_bulk_dataset(session_id, access_key, reps):
                         rc = data.get('roll_call', {})
                         votes = rc.get('votes', [])
                         
-                        # Force these to act as integers, just in case LegiScan uses text
                         yeas = int(rc.get('yea', 0))
                         nays = int(rc.get('nay', 0))
                         total = yeas + nays
                         
+                        # Skip if absolutely no one voted (like a cancelled roll call)
                         if total == 0:
                             continue
                             
-                        # 1. Check if the vote is contested (At least 10% opposition)
-                        opposition_rate = min(yeas, nays) / total
-                        if opposition_rate < 0.10: 
-                            continue
-                            
+                        # We removed the 10% opposition filter here!
+                        # Now every single valid roll call gets counted.
                         analyzed_roll_calls += 1
                         
-                        # 2. Determine Party Lines
+                        # 1. Determine Party Lines
                         party_tallies = {'D': {1: 0, 2: 0}, 'R': {1: 0, 2: 0}}
                         for vote in votes:
                             pid = vote['people_id']
@@ -104,13 +101,13 @@ def process_bulk_dataset(session_id, access_key, reps):
                         dem_line = 1 if party_tallies['D'][1] > party_tallies['D'][2] else 2
                         gop_line = 1 if party_tallies['R'][1] > party_tallies['R'][2] else 2
                         
-                        # 3. Grade the Representatives based on the true party line
+                        # 2. Grade the Representatives based on the party line
                         for vote in votes:
                             pid = vote['people_id']
                             v_id = int(vote['vote_id'])
                             
                             if pid in reps and v_id in [1, 2]:
-                                reps[pid]['Contested Votes Cast'] += 1
+                                reps[pid]['Total Votes Cast'] += 1
                                 party = reps[pid]['Party']
                                 
                                 if party == 'D' and v_id != dem_line:
@@ -124,20 +121,20 @@ def process_bulk_dataset(session_id, access_key, reps):
                         
     print(f"Total Roll Call files found in ZIP: {total_roll_calls_found}")
     print(f"Total files that crashed during read: {errors_encountered}")
-    print(f"Highly contested votes successfully evaluated: {analyzed_roll_calls}")
+    print(f"Total votes successfully evaluated: {analyzed_roll_calls}")
     return list(reps.values())
 
 def save_to_csv(data, filename='mi_reps_data.csv'):
     print(f"Saving Final Rebel Data to {filename}...")
     
     for row in data:
-        if row['Contested Votes Cast'] > 0:
-            row['True Rebellion Rate (%)'] = round((row['Votes Against Party'] / row['Contested Votes Cast']) * 100, 1)
+        if row['Total Votes Cast'] > 0:
+            row['Rebellion Rate (%)'] = round((row['Votes Against Party'] / row['Total Votes Cast']) * 100, 1)
         else:
-            row['True Rebellion Rate (%)'] = 0.0
+            row['Rebellion Rate (%)'] = 0.0
 
-    data = sorted(data, key=lambda x: x['True Rebellion Rate (%)'], reverse=True) 
-    headers = ['Name', 'Party', 'Contested Votes Cast', 'Votes Against Party', 'True Rebellion Rate (%)']
+    data = sorted(data, key=lambda x: x['Rebellion Rate (%)'], reverse=True) 
+    headers = ['Name', 'Party', 'Total Votes Cast', 'Votes Against Party', 'Rebellion Rate (%)']
     
     with open(filename, mode='w', newline='', encoding='utf-8') as file:
         writer = csv.DictWriter(file, fieldnames=headers)
