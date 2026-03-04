@@ -16,7 +16,10 @@ def get_current_session():
     params = {'key': API_KEY, 'op': 'getSessionList', 'state': STATE}
     r = requests.get(BASE_URL, params=params).json()
     if r.get('status') == 'OK':
-        latest = max(r['sessions'], key=lambda x: x['session_id'])
+        # Filter out empty Special Sessions, only grab Regular Sessions
+        regular_sessions = [s for s in r['sessions'] if s.get('special') == 0]
+        latest = max(regular_sessions, key=lambda x: x['session_id'])
+        print(f"Targeting: {latest.get('session_title')} (ID: {latest['session_id']})")
         return latest['session_id']
     return None
 
@@ -48,7 +51,7 @@ def get_representatives(session_id):
     return reps
 
 def process_bulk_dataset(session_id, access_key, reps):
-    print("Downloading Bulk Dataset archive (this may take 10-20 seconds)...")
+    print("Downloading Bulk Dataset archive...")
     params = {'key': API_KEY, 'op': 'getDataset', 'id': session_id, 'access_key': access_key}
     r = requests.get(BASE_URL, params=params).json()
     
@@ -56,32 +59,34 @@ def process_bulk_dataset(session_id, access_key, reps):
         print("Failed to download dataset.")
         return list(reps.values())
         
-    print("Unzipping archive and analyzing thousands of votes...")
+    print("Unzipping archive and analyzing votes...")
     zip_bytes = base64.b64decode(r['dataset']['zip'])
     
+    total_roll_calls_found = 0
     analyzed_roll_calls = 0
+    errors_encountered = 0
     
-    # Unzip the file directly in the cloud's memory
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
         for filename in z.namelist():
-            # Find the roll call files hidden inside the ZIP folders
             if 'roll_call' in filename.lower() and filename.endswith('.json'):
+                total_roll_calls_found += 1
                 with z.open(filename) as f:
                     try:
                         data = json.load(f)
                         rc = data.get('roll_call', {})
                         votes = rc.get('votes', [])
                         
-                        # 1. Check if the vote is contested (At least 10% opposition)
-                        yeas = rc.get('yea', 0)
-                        nays = rc.get('nay', 0)
+                        # Force these to act as integers, just in case LegiScan uses text
+                        yeas = int(rc.get('yea', 0))
+                        nays = int(rc.get('nay', 0))
                         total = yeas + nays
                         
                         if total == 0:
                             continue
                             
+                        # 1. Check if the vote is contested (At least 10% opposition)
                         opposition_rate = min(yeas, nays) / total
-                        if opposition_rate < 0.10: # Skip uncontroversial votes
+                        if opposition_rate < 0.10: 
                             continue
                             
                         analyzed_roll_calls += 1
@@ -90,7 +95,7 @@ def process_bulk_dataset(session_id, access_key, reps):
                         party_tallies = {'D': {1: 0, 2: 0}, 'R': {1: 0, 2: 0}}
                         for vote in votes:
                             pid = vote['people_id']
-                            v_id = vote['vote_id']
+                            v_id = int(vote['vote_id'])
                             if pid in reps and v_id in [1, 2]: # 1 = Yea, 2 = Nay
                                 party = reps[pid]['Party']
                                 if party in party_tallies:
@@ -102,7 +107,7 @@ def process_bulk_dataset(session_id, access_key, reps):
                         # 3. Grade the Representatives based on the true party line
                         for vote in votes:
                             pid = vote['people_id']
-                            v_id = vote['vote_id']
+                            v_id = int(vote['vote_id'])
                             
                             if pid in reps and v_id in [1, 2]:
                                 reps[pid]['Contested Votes Cast'] += 1
@@ -113,23 +118,24 @@ def process_bulk_dataset(session_id, access_key, reps):
                                 elif party == 'R' and v_id != gop_line:
                                     reps[pid]['Votes Against Party'] += 1
                                     
-                    except Exception:
-                        continue # If a file is corrupted, just skip it and move on
+                    except Exception as e:
+                        errors_encountered += 1
+                        continue 
                         
-    print(f"Analysis complete. Evaluated {analyzed_roll_calls} highly contested roll calls across the entire session.")
+    print(f"Total Roll Call files found in ZIP: {total_roll_calls_found}")
+    print(f"Total files that crashed during read: {errors_encountered}")
+    print(f"Highly contested votes successfully evaluated: {analyzed_roll_calls}")
     return list(reps.values())
 
 def save_to_csv(data, filename='mi_reps_data.csv'):
     print(f"Saving Final Rebel Data to {filename}...")
     
-    # Calculate the exact rebellion percentage
     for row in data:
         if row['Contested Votes Cast'] > 0:
             row['True Rebellion Rate (%)'] = round((row['Votes Against Party'] / row['Contested Votes Cast']) * 100, 1)
         else:
             row['True Rebellion Rate (%)'] = 0.0
 
-    # Sort the most independent legislators to the very top
     data = sorted(data, key=lambda x: x['True Rebellion Rate (%)'], reverse=True) 
     headers = ['Name', 'Party', 'Contested Votes Cast', 'Votes Against Party', 'True Rebellion Rate (%)']
     
