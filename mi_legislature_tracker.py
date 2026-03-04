@@ -68,24 +68,23 @@ def process_bulk_dataset(session_id, access_key, reps):
     
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
         for filename in z.namelist():
-            if 'roll_call' in filename.lower() and filename.endswith('.json'):
+            # FIX: LegiScan puts these in a folder named 'vote', not 'roll_call'!
+            if '/vote/' in filename.lower() and filename.endswith('.json'):
                 total_roll_calls_found += 1
                 with z.open(filename) as f:
                     try:
                         data = json.load(f)
-                        rc = data.get('roll_call', {})
+                        # Ensure we grab the data regardless of what LegiScan names the JSON key
+                        rc = data.get('roll_call') or data.get('vote') or {}
                         votes = rc.get('votes', [])
                         
                         yeas = int(rc.get('yea', 0))
                         nays = int(rc.get('nay', 0))
                         total = yeas + nays
                         
-                        # Skip if absolutely no one voted (like a cancelled roll call)
                         if total == 0:
                             continue
                             
-                        # We removed the 10% opposition filter here!
-                        # Now every single valid roll call gets counted.
                         analyzed_roll_calls += 1
                         
                         # 1. Determine Party Lines
@@ -119,7 +118,7 @@ def process_bulk_dataset(session_id, access_key, reps):
                         errors_encountered += 1
                         continue 
                         
-    print(f"Total Roll Call files found in ZIP: {total_roll_calls_found}")
+    print(f"Total 'vote' files found in ZIP: {total_roll_calls_found}")
     print(f"Total files that crashed during read: {errors_encountered}")
     print(f"Total votes successfully evaluated: {analyzed_roll_calls}")
     return list(reps.values())
